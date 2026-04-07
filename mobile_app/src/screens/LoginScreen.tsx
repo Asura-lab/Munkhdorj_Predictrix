@@ -55,8 +55,8 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ navigation }) => {
         // Register/refresh push token right after login so alerts work even when app is closed.
         try {
           await initializePushNotifications();
-        } catch (pushErr) {
-          console.log("[WARN] Push init after login failed:", pushErr);
+        } catch {
+          // Push init failures are non-blocking for login flow.
         }
 
         navigation.reset({

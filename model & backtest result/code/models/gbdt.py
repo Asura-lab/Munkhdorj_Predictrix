@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 
@@ -52,10 +52,13 @@ def fit_models(
     """
     models: Dict[str, object] = {}
 
+    is_multiclass = len(np.unique(y)) > 2
+    num_classes = int(len(np.unique(y)))
+
     lgb = _try_import_lightgbm()
     if lgb is not None:
         # PHASE 7B: Anti-overfitting configuration + GPU
-        model = lgb.LGBMClassifier(
+        lgb_params = dict(
             n_estimators=500,  # More trees but with early stopping
             learning_rate=0.03,  # Slower learning (was 0.05)
             max_depth=6,  # Limited depth (was -1 unlimited!)
@@ -65,11 +68,19 @@ def fit_models(
             reg_alpha=0.1,  # L1 regularization
             reg_lambda=1.0,  # L2 regularization (stronger)
             min_child_samples=20,  # Prevent tiny leaves
-            scale_pos_weight=pos_weight,
             random_state=random_state,
             device='gpu',  # GPU acceleration
             verbose=-1,
         )
+
+        if is_multiclass:
+            lgb_params['objective'] = 'multiclass'
+            lgb_params['num_class'] = num_classes
+            lgb_params['class_weight'] = 'balanced'
+        else:
+            lgb_params['scale_pos_weight'] = pos_weight
+
+        model = lgb.LGBMClassifier(**lgb_params)
         
         if X_val is not None and y_val is not None:
             # Early stopping on validation set
@@ -87,7 +98,7 @@ def fit_models(
     xgb = _try_import_xgboost()
     if xgb is not None:
         # PHASE 7B: Anti-overfitting configuration
-        model = xgb.XGBClassifier(
+        xgb_params = dict(
             n_estimators=500,
             learning_rate=0.03,  # Slower (was 0.05)
             max_depth=5,  # Shallower trees (was 8)
@@ -97,12 +108,20 @@ def fit_models(
             reg_lambda=1.0,  # L2 regularization
             min_child_weight=5,  # Prevent overfitting
             gamma=0.1,  # Min loss reduction for split
-            eval_metric="mlogloss",  # Multi-class metric
-            scale_pos_weight=pos_weight,
+            eval_metric="mlogloss" if is_multiclass else "logloss",
             random_state=random_state,
             tree_method='hist',  # Fast histogram-based (CPU)
             verbosity=0,
         )
+
+        if is_multiclass:
+            xgb_params['objective'] = 'multi:softprob'
+            xgb_params['num_class'] = num_classes
+        else:
+            xgb_params['objective'] = 'binary:logistic'
+            xgb_params['scale_pos_weight'] = pos_weight
+
+        model = xgb.XGBClassifier(**xgb_params)
         
         if X_val is not None and y_val is not None:
             # Early stopping on validation set (new syntax)
@@ -156,8 +175,31 @@ def fit_models(
 
 
 def predict_proba(models: Dict[str, object], X: np.ndarray) -> np.ndarray:
+    """Return ensemble probability for the target trade class.
+
+    For multiclass models (SELL/HOLD/BUY => 0/1/2), BUY (class 2) is used as
+    the positive class by default so downstream calibration/evaluation stays
+    mathematically consistent.
+    """
     probs = []
     for model in models.values():
-        p = model.predict_proba(X)[:, 1]
-        probs.append(p)
+        p_all = model.predict_proba(X)
+        if p_all.ndim == 1:
+            probs.append(p_all)
+            continue
+
+        classes = np.array(getattr(model, 'classes_', np.arange(p_all.shape[1])))
+        if p_all.shape[1] == 2:
+            pos_index = 1
+        else:
+            if 2 in classes:
+                pos_index = int(np.where(classes == 2)[0][0])
+            else:
+                pos_index = p_all.shape[1] - 1
+
+        probs.append(p_all[:, pos_index])
+
+    if not probs:
+        raise RuntimeError("No model probabilities produced.")
+
     return np.mean(np.vstack(probs), axis=0)

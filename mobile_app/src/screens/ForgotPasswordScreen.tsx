@@ -40,6 +40,7 @@ const ForgotPasswordScreen = ({ navigation }: { navigation: any }) => {
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [verifiedCode, setVerifiedCode] = useState("");
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [demoCode, setDemoCode] = useState(null);
@@ -53,6 +54,7 @@ const ForgotPasswordScreen = ({ navigation }: { navigation: any }) => {
       return;
     }
 
+    setVerifiedCode("");
     setLoading(true);
 
     try {
@@ -98,10 +100,12 @@ const ForgotPasswordScreen = ({ navigation }: { navigation: any }) => {
       const result = await verifyResetCode(email, verificationCode);
 
       if (result.success) {
+        setVerifiedCode(verificationCode);
         showAlert("Амжилттай", "Код баталгаажлаа", [
           { text: "OK", onPress: () => setStep(3) },
         ]);
       } else {
+        setVerifiedCode("");
         showAlert("Алдаа", result.error || "Буруу код");
         setCode(["", "", "", "", "", ""]);
         inputRefs.current[0]?.focus();
@@ -133,7 +137,8 @@ const ForgotPasswordScreen = ({ navigation }: { navigation: any }) => {
     setLoading(true);
 
     try {
-      const result = await resetPassword(email, code.join(""), newPassword);
+      const codeToUse = verifiedCode || code.join("");
+      const result = await resetPassword(email, codeToUse, newPassword);
 
       if (result.success) {
         showAlert("Амжилттай!", "Таны нууц үг амжилттай солигдлоо", [

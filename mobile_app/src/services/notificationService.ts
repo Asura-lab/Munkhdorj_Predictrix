@@ -18,7 +18,35 @@ import { API_BASE_URL } from "../config/api";
 
 const PUSH_TOKEN_KEY = "@push_token";
 const PUSH_TOKEN_LAST_SYNC_KEY = "@push_token_last_sync";
+const PUSH_HEALTHCHECK_TOKEN_KEY = "@push_healthcheck_token";
 const PUSH_TOKEN_SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const AUTH_TOKEN_KEY = "userToken";
+let pushInitInFlight: Promise<string | null> | null = null;
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function sendPushHealthcheckPing(): Promise<boolean> {
+  try {
+    const userToken = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
+    if (!userToken) return false;
+
+    const response = await axios.post(
+      `${API_BASE_URL}/notifications/test`,
+      {},
+      {
+        headers: {
+          Authorization: `Bearer ${userToken}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+      }
+    );
+
+    return Boolean(response.data?.success);
+  } catch {
+    return false;
+  }
+}
 
 // ==================== NOTIFICATION CONFIGURATION ====================
 
@@ -59,7 +87,6 @@ export async function getDeviceId(): Promise<string> {
 export async function requestNotificationPermission(): Promise<boolean> {
   try {
     if (!Device.isDevice) {
-      console.log("[WARN] Push notifications require a physical device");
       return false;
     }
 
@@ -85,7 +112,6 @@ export async function getExpoPushToken(): Promise<string | null> {
   try {
     // Physical device шаардлагатай (simulator дээр ажиллахгүй)
     if (!Device.isDevice) {
-      console.log("[WARN] Push notifications require a physical device");
       return null;
     }
 
@@ -100,7 +126,6 @@ export async function getExpoPushToken(): Promise<string | null> {
     }
 
     if (finalStatus !== "granted") {
-      console.log("[WARN] Push notification permission denied");
       return null;
     }
 
@@ -113,12 +138,7 @@ export async function getExpoPushToken(): Promise<string | null> {
       ? await Notifications.getExpoPushTokenAsync({ projectId })
       : await Notifications.getExpoPushTokenAsync();
 
-    if (!projectId) {
-      console.log("[WARN] EAS projectId not found, using fallback push token request");
-    }
-
     const token = tokenData.data;
-    console.log("[OK] Expo Push Token:", token);
 
     // Android notification channels
     if (Platform.OS === "android") {
@@ -172,9 +192,8 @@ export async function registerPushTokenWithServer(
   pushToken: string
 ): Promise<boolean> {
   try {
-    const userToken = await AsyncStorage.getItem("userToken");
+    const userToken = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
     if (!userToken) {
-      console.log("[WARN] No auth token, skipping push token registration");
       return false;
     }
 
@@ -218,7 +237,7 @@ export async function registerPushTokenWithServer(
  */
 export async function unregisterPushTokenFromServer(): Promise<boolean> {
   try {
-    const userToken = await AsyncStorage.getItem("userToken");
+    const userToken = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
     if (!userToken) return false;
 
     const response = await axios.post(
@@ -272,7 +291,7 @@ export async function getNotificationPreferences(): Promise<NotificationPreferen
   };
 
   try {
-    const userToken = await AsyncStorage.getItem("userToken");
+    const userToken = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
     if (!userToken) {
       return defaults;
     }
@@ -289,10 +308,7 @@ export async function getNotificationPreferences(): Promise<NotificationPreferen
       return { ...defaults, ...response.data.preferences };
     }
   } catch (error: any) {
-    if (error?.response?.status === 401) {
-      await AsyncStorage.removeItem("userToken");
-      console.warn("[WARN] Notification preferences: token expired, cleared stored token.");
-    } else {
+    if (error?.response?.status !== 401) {
       console.error("[ERROR] Get notification preferences failed:", error.message);
     }
   }
@@ -307,7 +323,7 @@ export async function updateNotificationPreferences(
   preferences: Partial<NotificationPreferences>
 ): Promise<boolean> {
   try {
-    const userToken = await AsyncStorage.getItem("userToken");
+    const userToken = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
     if (!userToken) return false;
 
     const response = await axios.put(
@@ -324,10 +340,7 @@ export async function updateNotificationPreferences(
 
     return response.data?.success ?? false;
   } catch (error: any) {
-    if (error?.response?.status === 401) {
-      await AsyncStorage.removeItem("userToken");
-      console.warn("[WARN] Update notification preferences: token expired, cleared stored token.");
-    } else {
+    if (error?.response?.status !== 401) {
       console.error(
         "[ERROR] Update notification preferences failed:",
         error.message
@@ -357,8 +370,8 @@ export function setupNotificationListeners(
         onNotificationResponse?.(response);
       }
     })
-    .catch((error) => {
-      console.log("[WARN] Failed to read last notification response:", error);
+    .catch(() => {
+      // Ignore non-critical startup read failures.
     });
 
   // Foreground notification listener
@@ -389,14 +402,21 @@ export function setupNotificationListeners(
  * Push notification бүхэлд нь тохируулах (App startup дээр дуудна)
  */
 export async function initializePushNotifications(): Promise<string | null> {
-  try {
-    const token = await getExpoPushToken();
+  if (pushInitInFlight) {
+    return pushInitInFlight;
+  }
 
-    if (token) {
-      const userToken = await AsyncStorage.getItem("userToken");
+  pushInitInFlight = (async () => {
+    try {
+      // Push setup is meaningful only for authenticated users.
+      const userToken = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
       if (!userToken) {
-        console.log("[INFO] Push init skipped: user not authenticated");
-        return token;
+        return null;
+      }
+
+      const token = await getExpoPushToken();
+      if (!token) {
+        return null;
       }
 
       const savedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY);
@@ -408,21 +428,39 @@ export async function initializePushNotifications(): Promise<string | null> {
         Number.isNaN(lastSync) ||
         Date.now() - lastSync > PUSH_TOKEN_SYNC_INTERVAL_MS;
 
-      if (shouldResync) {
-        const ok = await registerPushTokenWithServer(token);
-        if (ok) {
-          await AsyncStorage.setItem(PUSH_TOKEN_KEY, token);
-          await AsyncStorage.setItem(
-            PUSH_TOKEN_LAST_SYNC_KEY,
-            String(Date.now())
-          );
+      if (!shouldResync) {
+        return token;
+      }
+
+      let ok = await registerPushTokenWithServer(token);
+      if (!ok) {
+        // One short retry helps on flaky mobile networks.
+        await wait(1200);
+        ok = await registerPushTokenWithServer(token);
+      }
+
+      if (ok) {
+        await AsyncStorage.setItem(PUSH_TOKEN_KEY, token);
+        await AsyncStorage.setItem(PUSH_TOKEN_LAST_SYNC_KEY, String(Date.now()));
+
+        // One-time token-level healthcheck to verify delivery path end-to-end.
+        const healthcheckToken = await AsyncStorage.getItem(PUSH_HEALTHCHECK_TOKEN_KEY);
+        if (healthcheckToken !== token) {
+          const pingOk = await sendPushHealthcheckPing();
+          if (pingOk) {
+            await AsyncStorage.setItem(PUSH_HEALTHCHECK_TOKEN_KEY, token);
+          }
         }
       }
-    }
 
-    return token;
-  } catch (error) {
-    console.error("[ERROR] Initialize push notifications failed:", error);
-    return null;
-  }
+      return token;
+    } catch (error) {
+      console.error("[ERROR] Initialize push notifications failed:", error);
+      return null;
+    } finally {
+      pushInitInFlight = null;
+    }
+  })();
+
+  return pushInitInFlight;
 }

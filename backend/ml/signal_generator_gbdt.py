@@ -6,6 +6,7 @@ Models: LightGBM + XGBoost + CatBoost ensemble with calibration
 """
 
 import os
+import glob
 import joblib
 import numpy as np
 import pandas as pd
@@ -18,14 +19,32 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 # Paths — model lives alongside this file in backend/ml/models/
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-LATEST_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'EURUSD_gbdt_experimental.pkl')
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+DEFAULT_MODEL_BASENAME = 'EURUSD_gbdt_experimental.pkl'
+LATEST_MODEL_PATH = os.path.join(MODELS_DIR, DEFAULT_MODEL_BASENAME)
 
 
 def resolve_model_path() -> str:
     """Resolve active model path.
 
-    App policy: always use the latest trained production model only.
+    Resolution order:
+    1) ACTIVE_GBDT_MODEL_PATH/GBDT_MODEL_PATH env override (promotion pin)
+    2) Newest EURUSD_gbdt*.pkl in backend/ml/models/
+    3) Legacy fallback path (EURUSD_gbdt_experimental.pkl)
     """
+    explicit = (os.getenv('ACTIVE_GBDT_MODEL_PATH') or os.getenv('GBDT_MODEL_PATH') or '').strip()
+    if explicit:
+        explicit_path = os.path.abspath(explicit)
+        if os.path.exists(explicit_path):
+            return explicit_path
+        print(f"[GBDT] ACTIVE_GBDT_MODEL_PATH not found: {explicit_path}")
+
+    pattern = os.path.join(MODELS_DIR, 'EURUSD_gbdt*.pkl')
+    candidates = [p for p in glob.glob(pattern) if os.path.isfile(p)]
+    if candidates:
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        return candidates[0]
+
     return LATEST_MODEL_PATH
 
 
@@ -274,6 +293,7 @@ class GBDTSignalGenerator:
                 print(f"[GBDT] Model file not found: {self.model_path}")
                 print("[GBDT] Latest model is required and no fallback model is allowed.")
                 print(f"[GBDT] Please export latest model to: {LATEST_MODEL_PATH}")
+                print("[GBDT] Or set ACTIVE_GBDT_MODEL_PATH to a promoted model artifact.")
                 return False
 
             print(f"[GBDT] Loading model from {self.model_path}...")

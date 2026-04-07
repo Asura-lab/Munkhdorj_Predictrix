@@ -63,8 +63,8 @@ android {
         applicationId 'com.asuralab.predictrix'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 8
-        versionName "0.4.4"
+        versionCode 9
+        versionName "0.4.5"
     }
     signingConfigs {
         debug {

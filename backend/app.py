@@ -14,20 +14,23 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_mail import Mail, Message
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from datetime import datetime, timedelta, timezone
 import jwt
 import bcrypt
 import os
 import random
 import re
+import uuid
 
 # Import configuration
 from config.settings import (
     MONGO_URI, SECRET_KEY, API_HOST, API_PORT,
     MAIL_SERVER, MAIL_PORT, MAIL_USE_TLS, MAIL_USE_SSL,
     MAIL_USERNAME, MAIL_PASSWORD, MAIL_DEFAULT_SENDER,
-    VERIFICATION_CODE_EXPIRY_MINUTES, RESET_CODE_EXPIRY_MINUTES
+    VERIFICATION_CODE_EXPIRY_MINUTES, RESET_CODE_EXPIRY_MINUTES,
+    JWT_ISSUER, JWT_AUDIENCE, ACCESS_TOKEN_EXPIRATION_MINUTES,
+    ALLOW_AUTH_CODE_IN_RESPONSE, ENABLE_BACKGROUND_JOBS, BG_LOCK_TTL_SECONDS,
 )
 import threading
 import time
@@ -87,6 +90,7 @@ try:
     reset_codes = db['reset_codes']
     signals_collection = db['signals']  # Таамгууд хадгалах collection
     in_app_notifications = db['in_app_notifications']  # In-app мэдэгдлүүд
+    runtime_locks = db['runtime_locks']  # Background task distributed locks
     # Migration: drop conflicting old index if it exists
     try:
         existing = {i['name'] for i in in_app_notifications.list_indexes()}
@@ -105,10 +109,47 @@ try:
         in_app_notifications.create_index('expires_at', expireAfterSeconds=0)
     except Exception as idx_err:
         print(f"[WARN] in_app_notifications TTL index: {idx_err}", flush=True)
+    try:
+        runtime_locks.create_index('expires_at', expireAfterSeconds=0)
+        runtime_locks.create_index('owner')
+    except Exception as idx_err:
+        print(f"[WARN] runtime_locks index: {idx_err}", flush=True)
     print("✓ MongoDB холбогдлоо", flush=True)
 except Exception as e:
     print(f"✗ MongoDB холбогдох алдаа: {e}", flush=True)
     exit(1)
+
+RUNTIME_OWNER_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def acquire_runtime_lock(lock_name: str, ttl_seconds: int = BG_LOCK_TTL_SECONDS) -> bool:
+    """Acquire or renew a short-lived distributed lock for background jobs."""
+    ttl = max(30, int(ttl_seconds))
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=ttl)
+    try:
+        result = runtime_locks.find_one_and_update(
+            {
+                '_id': lock_name,
+                '$or': [
+                    {'expires_at': {'$lte': now}},
+                    {'owner': RUNTIME_OWNER_ID},
+                ],
+            },
+            {
+                '$set': {
+                    'owner': RUNTIME_OWNER_ID,
+                    'updated_at': now,
+                    'expires_at': expires_at,
+                },
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return bool(result and result.get('owner') == RUNTIME_OWNER_ID)
+    except Exception as e:
+        print(f"[WARN] Lock acquire failed ({lock_name}): {e}")
+        return False
 
 # ==================== SIGNAL GENERATORS ====================
 
@@ -264,16 +305,11 @@ news_cache = NewsCache()
 def news_updater_task():
     """Background task to update news every 30 minutes"""
     print("[INFO] Starting background news updater...")
-    # Initial update
-    news_cache.update()
-    
     while True:
-        # Sleep for 30 minutes (1800 seconds)
+        if acquire_runtime_lock('jobs:news_updater'):
+            news_cache.update()
+        # Run every 30 minutes
         time.sleep(1800)
-        news_cache.update()
-
-# Start background updater
-threading.Thread(target=news_updater_task, daemon=True).start()
 
 # ==================== NEWS NOTIFICATION SCHEDULER ====================
 # Checks upcoming events every 2 minutes, sends notifications 10 min before event
@@ -284,6 +320,10 @@ def news_notification_scheduler():
     time.sleep(30)  # Wait for initial news cache to load
     
     while True:
+        if not acquire_runtime_lock('jobs:news_notification_scheduler'):
+            time.sleep(120)
+            continue
+
         try:
             upcoming = news_cache.get('upcoming')
             if upcoming:
@@ -385,9 +425,6 @@ def news_notification_scheduler():
         
         time.sleep(120)  # Check every 2 minutes
 
-# Start news notification scheduler
-threading.Thread(target=news_notification_scheduler, daemon=True).start()
-
 # ==================== CONTINUOUS SIGNAL GENERATOR ====================
 # Минут тутамд таамаглал гаргаж, итгэлцэл >= 0.9 бол DB-д хадгалж,
 # хэрэглэгчийн босгоос дээш бол push notification илгээнэ.
@@ -429,6 +466,10 @@ def continuous_signal_generator():
     print("[OK] Continuous signal generator active.")
     
     while True:
+        if not acquire_runtime_lock('jobs:continuous_signal_generator'):
+            time.sleep(15)
+            continue
+
         for pair in SIGNAL_PAIRS:
             try:
                 # Check if market is closed
@@ -550,8 +591,20 @@ def continuous_signal_generator():
         # Wait 60 seconds before next cycle
         time.sleep(60)
 
-# Start continuous signal generator
-threading.Thread(target=continuous_signal_generator, daemon=True).start()
+
+def start_background_workers():
+    """Start background workers only when explicitly enabled."""
+    if not ENABLE_BACKGROUND_JOBS:
+        print("[INFO] Background workers disabled (ENABLE_BACKGROUND_JOBS=false)")
+        return
+
+    print(f"[INFO] Background workers enabled (owner={RUNTIME_OWNER_ID})")
+    threading.Thread(target=news_updater_task, daemon=True).start()
+    threading.Thread(target=news_notification_scheduler, daemon=True).start()
+    threading.Thread(target=continuous_signal_generator, daemon=True).start()
+
+
+start_background_workers()
 
 # ==================== IN-APP NOTIFICATION HELPERS ====================
 
@@ -579,25 +632,43 @@ def save_in_app_notification(ntype: str, title: str, body: str, data: dict = Non
 # ==================== AUTH HELPERS ====================
 
 def generate_token(user_id, email):
+    now = datetime.now(timezone.utc)
     payload = {
         'user_id': str(user_id),
         'email': email,
-        'exp': datetime.now(timezone.utc) + timedelta(days=7)
+        'iat': now,
+        'iss': JWT_ISSUER,
+        'aud': JWT_AUDIENCE,
+        'exp': now + timedelta(minutes=ACCESS_TOKEN_EXPIRATION_MINUTES),
     }
     return jwt.encode(payload, SECRET_KEY, algorithm='HS256')
 
 def verify_token(token):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=['HS256'],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={'require': ['exp', 'iat', 'iss', 'aud']},
+        )
         return payload
-    except:
+    except Exception:
         return None
+
+
+def _extract_bearer_token() -> str:
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        return auth_header.split(' ', 1)[1].strip()
+    return ''
 
 def token_required(f):
     from functools import wraps
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        token = _extract_bearer_token()
         if not token:
             return jsonify({'error': 'Token шаардлагатай'}), 401
         payload = verify_token(token)
@@ -659,7 +730,7 @@ def send_reset_email_async(email, code):
 
 @app.route('/auth/register', methods=['POST'])
 def register():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     name = data.get('name', '').strip()
     email = data.get('email', '').strip().lower()
     password = data.get('password', '')
@@ -698,16 +769,17 @@ def register():
             'message': 'Баталгаажуулах код илгээлээ',
             'email': email
         })
-    else:
-        # Return code directly — either email not configured or SMTP failed
+
+    response = {
+        'success': True,
+        'message': 'Код үүсгэлээ. Имэйл үйлчилгээ түр доголдсон тул дахин оролдоно уу.',
+        'email': email,
+    }
+    if ALLOW_AUTH_CODE_IN_RESPONSE:
         print(f"[DEMO] Verification code for {email}: {code}")
-        return jsonify({
-            'success': True,
-            'message': 'Demo горим: код апп дотор харагдана',
-            'email': email,
-            'demo_mode': True,
-            'verification_code': code
-        })
+        response['demo_mode'] = True
+        response['verification_code'] = code
+    return jsonify(response)
 
 @app.route('/auth/verify-email', methods=['POST'])
 def verify_email():
@@ -752,7 +824,7 @@ def verify_email():
 
 @app.route('/auth/resend-verification', methods=['POST'])
 def resend_verification():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email', '').strip().lower()
     
     record = verification_codes.find_one({'email': email})
@@ -772,18 +844,20 @@ def resend_verification():
     resent = send_verification_email(email, code, record.get('name', '')) if is_email_configured() else False
     if resent:
         return jsonify({'success': True, 'message': 'Код дахин илгээлээ'})
-    else:
+
+    response = {
+        'success': True,
+        'message': 'Код үүсгэлээ. Имэйл үйлчилгээ түр доголдсон тул дахин оролдоно уу.',
+    }
+    if ALLOW_AUTH_CODE_IN_RESPONSE:
         print(f"[DEMO] Resend verification code for {email}: {code}")
-        return jsonify({
-            'success': True,
-            'message': 'Demo горим: код апп дотор харагдана',
-            'demo_mode': True,
-            'verification_code': code
-        })
+        response['demo_mode'] = True
+        response['verification_code'] = code
+    return jsonify(response)
 
 @app.route('/auth/login', methods=['POST'])
 def login():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email', '').strip().lower()
     password = data.get('password', '')
     device_id = data.get('device_id', '')
@@ -835,6 +909,33 @@ def login():
         }
     })
 
+
+@app.route('/auth/verify', methods=['POST'])
+def verify_auth_token():
+    """Check whether a JWT token is valid (for mobile auth bootstrap)."""
+    data = request.get_json(silent=True) or {}
+    token = str(data.get('token', '')).strip() or _extract_bearer_token()
+    if not token:
+        return jsonify({'success': False, 'valid': False, 'error': 'Token шаардлагатай'}), 400
+
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({'success': True, 'valid': False}), 200
+
+    user = users_collection.find_one({'email': payload.get('email')})
+    if not user:
+        return jsonify({'success': True, 'valid': False}), 200
+
+    return jsonify({
+        'success': True,
+        'valid': True,
+        'user': {
+            'name': user.get('name', ''),
+            'email': user.get('email', ''),
+            'email_verified': user.get('email_verified', False),
+        }
+    }), 200
+
 @app.route('/auth/me', methods=['GET'])
 @token_required
 def get_me(payload):
@@ -851,9 +952,74 @@ def get_me(payload):
         }
     })
 
+
+@app.route('/auth/update', methods=['PUT'])
+@token_required
+def update_profile(payload):
+    data = request.get_json(silent=True) or {}
+    name = data.get('name', '').strip()
+
+    if not name:
+        return jsonify({'error': 'Нэр хоосон байж болохгүй'}), 400
+    if len(name) > 80:
+        return jsonify({'error': 'Нэр хэт урт байна'}), 400
+
+    result = users_collection.update_one(
+        {'email': payload.get('email')},
+        {'$set': {'name': name, 'updated_at': datetime.now(timezone.utc)}}
+    )
+
+    if result.matched_count == 0:
+        return jsonify({'error': 'Хэрэглэгч олдсонгүй'}), 404
+
+    user = users_collection.find_one({'email': payload.get('email')})
+    return jsonify({
+        'success': True,
+        'message': 'Профайл амжилттай шинэчлэгдлээ',
+        'user': {
+            'name': user.get('name', ''),
+            'email': user.get('email', ''),
+            'email_verified': user.get('email_verified', False),
+        }
+    })
+
+
+@app.route('/auth/change-password', methods=['PUT'])
+@token_required
+def change_password(payload):
+    data = request.get_json(silent=True) or {}
+    old_password = (data.get('oldPassword') or data.get('old_password') or '').strip()
+    new_password = (data.get('newPassword') or data.get('new_password') or '').strip()
+
+    if not old_password or not new_password:
+        return jsonify({'error': 'oldPassword болон newPassword шаардлагатай'}), 400
+    if len(new_password) < 6:
+        return jsonify({'error': 'Шинэ нууц үг хамгийн багадаа 6 тэмдэгт'}), 400
+    if old_password == new_password:
+        return jsonify({'error': 'Шинэ нууц үг өмнөхтэй ижил байж болохгүй'}), 400
+
+    user = users_collection.find_one({'email': payload.get('email')})
+    if not user:
+        return jsonify({'error': 'Хэрэглэгч олдсонгүй'}), 404
+
+    stored_password = user.get('password', '')
+    if isinstance(stored_password, str):
+        stored_password = stored_password.encode()
+
+    if not bcrypt.checkpw(old_password.encode(), stored_password):
+        return jsonify({'error': 'Одоогийн нууц үг буруу байна'}), 400
+
+    hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    users_collection.update_one(
+        {'email': payload.get('email')},
+        {'$set': {'password': hashed, 'password_updated_at': datetime.now(timezone.utc)}}
+    )
+
+    return jsonify({'success': True, 'message': 'Нууц үг амжилттай солигдлоо'})
+
 @app.route('/auth/forgot-password', methods=['POST'])
 def forgot_password():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email', '').strip().lower()
     
     user = users_collection.find_one({'email': email})
@@ -885,21 +1051,46 @@ def forgot_password():
 
     if reset_sent:
         return jsonify({'success': True, 'message': 'Код илгээлээ'})
-    else:
+
+    response = {
+        'success': True,
+        'message': 'Код үүсгэлээ. Имэйл үйлчилгээ түр доголдсон тул дахин оролдоно уу.',
+    }
+    if ALLOW_AUTH_CODE_IN_RESPONSE:
         print(f"[DEMO] Reset code for {email}: {code}")
-        return jsonify({
-            'success': True,
-            'message': 'Demo горим: код апп дотор харагдана',
-            'demo_mode': True,
-            'reset_code': code
-        })
+        response['demo_mode'] = True
+        response['reset_code'] = code
+    return jsonify(response)
+
+
+@app.route('/auth/verify-reset-code', methods=['POST'])
+def verify_reset_code():
+    data = request.get_json(silent=True) or {}
+    email = data.get('email', '').strip().lower()
+    code = data.get('code', '').strip()
+
+    if not email or not code:
+        return jsonify({'error': 'email болон code шаардлагатай'}), 400
+
+    record = reset_codes.find_one({
+        'email': email,
+        'code': code,
+        'expires_at': {'$gt': datetime.now(timezone.utc)}
+    })
+    if not record:
+        return jsonify({'error': 'Код буруу эсвэл хугацаа дууссан'}), 400
+
+    return jsonify({'success': True, 'message': 'Код хүчинтэй'})
 
 @app.route('/auth/reset-password', methods=['POST'])
 def reset_password():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email', '').strip().lower()
     code = data.get('code', '').strip()
     new_password = data.get('new_password', '')
+
+    if not email or not code or not new_password:
+        return jsonify({'error': 'email, code, new_password шаардлагатай'}), 400
     
     if len(new_password) < 6:
         return jsonify({'error': 'Нууц үг хамгийн багадаа 6 тэмдэгт'}), 400
@@ -913,8 +1104,15 @@ def reset_password():
     if not record:
         return jsonify({'error': 'Код буруу эсвэл хугацаа дууссан'}), 400
     
+    user = users_collection.find_one({'email': email})
+    if not user:
+        return jsonify({'error': 'Хэрэглэгч олдсонгүй'}), 404
+
     hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-    users_collection.update_one({'email': email}, {'$set': {'password': hashed}})
+    users_collection.update_one(
+        {'email': email},
+        {'$set': {'password': hashed, 'password_updated_at': datetime.now(timezone.utc)}}
+    )
     reset_codes.delete_many({'email': email})
     
     return jsonify({'success': True, 'message': 'Нууц үг амжилттай солигдлоо'})
@@ -933,7 +1131,12 @@ def register_push_token():
         return jsonify({'error': 'Token буруу'}), 401
     
     data = request.json or {}
-    push_token = data.get('push_token', '').strip()
+    push_token = (
+        data.get('push_token')
+        or data.get('expo_push_token')
+        or data.get('token')
+        or ''
+    ).strip()
     platform = data.get('platform', 'unknown')
     device_id = data.get('device_id', '')
     
@@ -1822,7 +2025,7 @@ def index():
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
-    PORT = 5000
+    PORT = API_PORT
     
     print("=" * 60)
     print("PREDICTRIX API v1.0")
@@ -1842,5 +2045,5 @@ if __name__ == '__main__':
     
     # Use waitress for production-ready server (more stable on Windows)
     from waitress import serve
-    print(f"\n[+] Server starting with Waitress on http://0.0.0.0:{PORT}")
-    serve(app, host='0.0.0.0', port=PORT, threads=4)
+    print(f"\n[+] Server starting with Waitress on http://{API_HOST}:{PORT}")
+    serve(app, host=API_HOST, port=PORT, threads=4)

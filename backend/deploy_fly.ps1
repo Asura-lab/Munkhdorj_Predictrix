@@ -1,6 +1,8 @@
 param(
     [string]$AppName = "predictrix-api",
     [string]$Region = "nrt",
+    [string]$SecretsFile = "",
+    [switch]$AllowDotenvSecrets,
     [switch]$KeepRunning
 )
 
@@ -13,6 +15,21 @@ function Fail($message) {
 
 function Info($message) {
     Write-Host "[INFO] $message" -ForegroundColor Cyan
+}
+
+function Get-SecretsFromDotEnv {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        return @()
+    }
+
+    return Get-Content $Path |
+        ForEach-Object { ($_ -split '#')[0].Trim() } |
+        Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' }
 }
 
 function Invoke-Fly {
@@ -127,13 +144,69 @@ $content = $content -replace 'app = ".*?"', ('app = "' + $AppName + '"')
 $content = $content -replace 'primary_region = ".*?"', ('primary_region = "' + $Region + '"')
 Set-Content .\fly.toml $content
 
-Info "Importing secrets from config/.env"
-$secretLines = Get-Content .\config\.env |
-    ForEach-Object { ($_ -split '#')[0].Trim() } |
-    Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' }
+Info "Collecting secrets (production-first)"
+$secretMap = @{}
+
+$preferredKeys = @(
+    "MONGO_URI",
+    "SECRET_KEY",
+    "MAIL_SERVER",
+    "MAIL_PORT",
+    "MAIL_USE_TLS",
+    "MAIL_USE_SSL",
+    "MAIL_USERNAME",
+    "MAIL_PASSWORD",
+    "MAIL_DEFAULT_SENDER",
+    "ALPHAVANTAGE_API_KEY",
+    "TWELVEDATA_API_KEY",
+    "JWT_ISSUER",
+    "JWT_AUDIENCE",
+    "ACCESS_TOKEN_EXPIRATION_MINUTES",
+    "REFRESH_TOKEN_EXPIRATION_DAYS",
+    "ALLOW_AUTH_CODE_IN_RESPONSE",
+    "ENABLE_BACKGROUND_JOBS",
+    "BG_LOCK_TTL_SECONDS",
+    "ACTIVE_GBDT_MODEL_PATH"
+)
+$preferredKeys += (1..21 | ForEach-Object { "GEMINI_API_KEY_$_" })
+
+# 1) Environment variables first
+foreach ($key in $preferredKeys) {
+    $val = [Environment]::GetEnvironmentVariable($key)
+    if (-not [string]::IsNullOrWhiteSpace($val)) {
+        $secretMap[$key] = $val
+    }
+}
+
+# 2) Optional dotenv fallback (explicit only)
+$dotenvPath = if (-not [string]::IsNullOrWhiteSpace($SecretsFile)) { $SecretsFile } else { ".\\config\\.env" }
+if ($AllowDotenvSecrets -or -not [string]::IsNullOrWhiteSpace($SecretsFile)) {
+    $dotenvLines = Get-SecretsFromDotEnv -Path $dotenvPath
+    foreach ($line in $dotenvLines) {
+        $parts = $line -split '=', 2
+        if ($parts.Count -ne 2) { continue }
+        $k = $parts[0].Trim()
+        $v = $parts[1]
+        if (-not $secretMap.ContainsKey($k) -and -not [string]::IsNullOrWhiteSpace($v)) {
+            $secretMap[$k] = $v
+        }
+    }
+    Info "Dotenv fallback enabled: $dotenvPath"
+} else {
+    Info "Dotenv fallback disabled. Using only process environment secrets."
+}
+
+$missingRequired = @("MONGO_URI", "SECRET_KEY") | Where-Object { -not $secretMap.ContainsKey($_) }
+if ($missingRequired.Count -gt 0) {
+    Fail ("Missing required secrets: " + ($missingRequired -join ", ") + ". Set env vars or use -AllowDotenvSecrets.")
+}
+
+$secretLines = $secretMap.GetEnumerator() |
+    Sort-Object Name |
+    ForEach-Object { "$($_.Name)=$($_.Value)" }
 
 if (-not $secretLines -or $secretLines.Count -eq 0) {
-    Fail "No valid secrets found in config/.env"
+    Fail "No secrets collected for import."
 }
 
 $tempSecrets = [System.IO.Path]::GetTempFileName()

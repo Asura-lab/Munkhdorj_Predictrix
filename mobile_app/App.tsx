@@ -21,7 +21,6 @@ import NotificationsScreen from "./src/screens/NotificationsScreen";
 import {
   initializePushNotifications,
   setupNotificationListeners,
-  requestNotificationPermission,
 } from "./src/services/notificationService";
 import { AlertProvider } from "./src/context/AlertContext";
 import AppAlert from "./src/components/AppAlert";
@@ -88,13 +87,6 @@ function AppContent() {
     return () => {
       subscription.remove();
     };
-  }, []);
-
-  // Request notification permission on first app load (before login)
-  useEffect(() => {
-    requestNotificationPermission().then((granted) => {
-      console.log("[NOTIFICATION] Permission:", granted ? "granted" : "denied");
-    });
   }, []);
 
   // Initialize push notifications after auth check

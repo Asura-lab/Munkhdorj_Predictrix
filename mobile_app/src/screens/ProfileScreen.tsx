@@ -38,6 +38,9 @@ interface ProfileScreenProps {
   navigation: NavigationProp<any>;
 }
 
+const USER_DATA_PRIMARY_KEY = "userData";
+const USER_DATA_LEGACY_KEY = "@user_data";
+
 /**
  * Profile Screen - Хэрэглэгчийн профайл
  */
@@ -81,7 +84,9 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
 
   const loadUserData = async () => {
     try {
-      const data = await AsyncStorage.getItem("userData");
+      const data =
+        (await AsyncStorage.getItem(USER_DATA_PRIMARY_KEY)) ||
+        (await AsyncStorage.getItem(USER_DATA_LEGACY_KEY));
       if (data) {
         const parsed = JSON.parse(data);
         setUserData(parsed);
@@ -151,8 +156,15 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
 
       if (result.success) {
         // Update local storage
-        const updatedUser = { ...userData, name };
-        await AsyncStorage.setItem("@user_data", JSON.stringify(updatedUser));
+        const serverUser = result.data?.user || {};
+        const updatedUser = {
+          ...(userData || {}),
+          ...serverUser,
+          name,
+          email: serverUser.email || userData?.email || email,
+        };
+        await AsyncStorage.setItem(USER_DATA_PRIMARY_KEY, JSON.stringify(updatedUser));
+        await AsyncStorage.setItem(USER_DATA_LEGACY_KEY, JSON.stringify(updatedUser));
         setUserData(updatedUser as UserData);
 
         showAlert("Амжилттай", "Таны мэдээлэл шинэчлэгдлээ", [

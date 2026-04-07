@@ -1,6 +1,6 @@
 {
   "name": "predictrix",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "AI-Powered Forex Trading Predictions - Predictrix",
   "main": "index.js",
   "scripts": {
@@ -21,6 +21,7 @@
     "expo": "~51.0.39",
     "expo-constants": "~16.0.2",
     "expo-device": "~6.0.2",
+    "expo-font": "~12.0.10",
     "expo-linear-gradient": "~13.0.2",
     "expo-notifications": "^0.28.19",
     "expo-splash-screen": "~0.27.0",
@@ -56,6 +57,13 @@
     "semver": "^7.6.3",
     "send": "^0.19.0",
     "tar": "^7.5.8"
+  },
+  "expo": {
+    "doctor": {
+      "appConfigFieldsNotSyncedCheck": {
+        "enabled": false
+      }
+    }
   },
   "private": true
 }

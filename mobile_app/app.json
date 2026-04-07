@@ -3,7 +3,7 @@
     "name": "Predictrix",
     "slug": "predictrix",
     "scheme": "predictrix",
-    "version": "0.4.4",
+    "version": "0.4.5",
     "sdkVersion": "51.0.0",
     "icon": "./assets/icon.png",
     "orientation": "portrait",
@@ -32,8 +32,7 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0F172A"
-      },
-      "useNextNotificationsApi": true
+      }
     },
     "plugins": [
       [
@@ -43,7 +42,8 @@
           "color": "#1a237e",
           "sounds": []
         }
-      ]
+      ],
+      "expo-font"
     ],
     "extra": {
       "eas": {

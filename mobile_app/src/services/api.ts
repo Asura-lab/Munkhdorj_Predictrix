@@ -4,6 +4,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { API_BASE_URL } from "../config/api";
 import { getDeviceId } from "./notificationService";
 
+const TOKEN_STORAGE_KEY = "userToken";
+const USER_STORAGE_KEY = "userData";
+let unauthorizedHandled = false;
+
 export interface UserData {
   id: string;
   name: string;
@@ -31,7 +35,7 @@ const apiClient: AxiosInstance = axios.create({
 // Request interceptor - Token автоматаар нэмэх
 apiClient.interceptors.request.use(
   async (config: InternalAxiosRequestConfig) => {
-    const token = await AsyncStorage.getItem("userToken");
+    const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -47,9 +51,12 @@ apiClient.interceptors.response.use(
   (response) => response,
   async (error: any) => {
     if (error?.response?.status === 401) {
-      // Token expired or invalid — clear it so the user can re-authenticate
-      await AsyncStorage.removeItem("userToken");
-      console.warn("[WARN] apiClient: 401 received, cleared stored token.");
+      // Clear session only once for a burst of unauthorized responses.
+      const hadAuthHeader = Boolean(error?.config?.headers?.Authorization);
+      if (hadAuthHeader && !unauthorizedHandled) {
+        unauthorizedHandled = true;
+        await AsyncStorage.multiRemove([TOKEN_STORAGE_KEY, USER_STORAGE_KEY]);
+      }
     }
 
     // Retry up to 3 times on network/timeout errors
@@ -108,9 +115,10 @@ export const verifyEmail = async (email: string, code: string): Promise<ApiRespo
 
     // Token-ийг хадгалах
     if (response.data.token) {
-      await AsyncStorage.setItem("userToken", response.data.token);
+      unauthorizedHandled = false;
+      await AsyncStorage.setItem(TOKEN_STORAGE_KEY, response.data.token);
       await AsyncStorage.setItem(
-        "userData",
+        USER_STORAGE_KEY,
         JSON.stringify(response.data.user)
       );
     }
@@ -156,9 +164,10 @@ export const loginUser = async (email: string, password: string): Promise<ApiRes
 
     // Token хадгалах
     if (response.data.token) {
-      await AsyncStorage.setItem("userToken", response.data.token);
+      unauthorizedHandled = false;
+      await AsyncStorage.setItem(TOKEN_STORAGE_KEY, response.data.token);
       await AsyncStorage.setItem(
-        "userData",
+        USER_STORAGE_KEY,
         JSON.stringify(response.data.user)
       );
     }
@@ -231,8 +240,9 @@ export const resetPassword = async (email: string, code: string, newPassword: st
  */
 export const logoutUser = async () => {
   try {
-    await AsyncStorage.removeItem("userToken");
-    await AsyncStorage.removeItem("userData");
+    unauthorizedHandled = false;
+    await AsyncStorage.removeItem(TOKEN_STORAGE_KEY);
+    await AsyncStorage.removeItem(USER_STORAGE_KEY);
     return { success: true };
   } catch (error: any) {
     return { success: false, error: error.message };
@@ -431,6 +441,10 @@ export const getMarketAnalysis = async (pair: string) => {
 export const updateUserProfile = async (name: string) => {
   try {
     const response = await apiClient.put("/auth/update", { name });
+    const updatedUser = response.data?.user;
+    if (updatedUser) {
+      await AsyncStorage.setItem(USER_STORAGE_KEY, JSON.stringify(updatedUser));
+    }
     return { success: true, data: response.data };
   } catch (error: any) {
     console.error("Profile шинэчлэх алдаа:", error.message);
@@ -449,6 +463,8 @@ export const changeUserPassword = async (oldPassword: string, newPassword: strin
     const response = await apiClient.put("/auth/change-password", {
       oldPassword,
       newPassword,
+      old_password: oldPassword,
+      new_password: newPassword,
     });
     return { success: true, data: response.data };
   } catch (error: any) {
@@ -466,7 +482,8 @@ export const changeUserPassword = async (oldPassword: string, newPassword: strin
  */
 export const getNews = async (type: string = "upcoming") => {
   try {
-    const response = await apiClient.get(`/api/news?type=${type}`);
+    const normalizedType = type === "past" ? "history" : type;
+    const response = await apiClient.get(`/api/news?type=${normalizedType}`);
     return { success: true, data: response.data };
   } catch (error: any) {
     console.error("Мэдээ авах алдаа:", error.message);
