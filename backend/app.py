@@ -913,31 +913,21 @@ def news_notification_scheduler():
 _start_background_job('news_scheduler', news_notification_scheduler, lock_ttl_seconds=360)
 
 # ==================== CONTINUOUS SIGNAL GENERATOR ====================
-# Минут тутамд таамаглал гаргаж, итгэлцэл >= 0.9 бол DB-д хадгалж,
-# хэрэглэгчийн босгоос дээш бол push notification илгээнэ.
+# Минут тутамд таамаглал гаргаж, BUY/SELL дохиог DB-д шууд хадгалж,
+# хэрэглэгчийн босгоос дээш үед push notification илгээнэ.
 
 # Supported currency pairs for continuous generation
 TRADING_SCOPE_PAIR = "EUR/USD"
 SIGNAL_PAIRS = [TRADING_SCOPE_PAIR]
 
-# Minimum confidence to save signal to DB (default: 0.9 = 90%)
-try:
-    SAVE_CONFIDENCE_THRESHOLD = float(os.environ.get("SAVE_CONFIDENCE_THRESHOLD", "0.9"))
-except Exception:
-    SAVE_CONFIDENCE_THRESHOLD = 0.9
-SAVE_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, SAVE_CONFIDENCE_THRESHOLD))
-
-# Cache to avoid duplicate signals within the same direction
-_last_signal_cache = {}  # { pair: { signal, timestamp } }
-
-# Signal endpoint response cache (per pair, 60s TTL)
-_signal_response_cache = {}  # { pair: { "data": ..., "time": ... } }
+# Signal endpoint response cache (pair+confidence key, 60s TTL)
+_signal_response_cache = {}  # { "pair|conf": { "data": ..., "time": ... } }
 SIGNAL_CACHE_TTL = 60  # seconds
 
 def continuous_signal_generator():
     """
     Background thread: минут тутамд модел ажиллуулж таамаглал гаргана.
-    - Итгэлцэл >= 90% бол MongoDB-д хадгална
+    - BUY/SELL дохио гармагц MongoDB-д хадгална
     - Хэрэглэгч бүрийн signal_threshold-оос дээш бол push мэдэгдэл илгээнэ
     """
     print("[INFO] Starting continuous signal generator (every 60s)...")
@@ -993,29 +983,20 @@ def continuous_signal_generator():
 
                 sig_type = result.get('signal', 'HOLD').upper()
                 sig_conf = result.get('confidence', 0)  # This is 0-100 percentage
-                conf_decimal = sig_conf / 100.0 if sig_conf > 1 else sig_conf
 
                 # For logging: HOLD-д hold_confidence (HOLD-ийн магадлал) харуулна
                 # BUY/SELL-д тухайн signal-ийн confidence харуулна
                 if sig_type == 'HOLD':
                     hold_conf_pct = result.get('hold_confidence', sig_conf)
                     dir_signal = result.get('directional_signal', '')
-                    print(f"[SIGNAL] {pair}: HOLD (hold={hold_conf_pct:.1f}%, lean={dir_signal} {sig_conf:.1f}%) (threshold: {SAVE_CONFIDENCE_THRESHOLD*100}%)")
+                    print(f"[SIGNAL] {pair}: HOLD (hold={hold_conf_pct:.1f}%, lean={dir_signal} {sig_conf:.1f}%)")
                 else:
-                    print(f"[SIGNAL] {pair}: {sig_type} @ {sig_conf:.1f}% (threshold: {SAVE_CONFIDENCE_THRESHOLD*100}%)")
+                    print(f"[SIGNAL] {pair}: {sig_type} @ {sig_conf:.1f}%")
 
-                # Only process BUY/SELL signals with confidence >= 0.9 (90%)
-                if sig_type in ('BUY', 'SELL') and conf_decimal >= SAVE_CONFIDENCE_THRESHOLD:
-                    model_provenance = _signal_provenance_from_result(result)
-                    # Check duplicate: skip if same signal type within last 5 minutes
-                    cache_key = pair
-                    last = _last_signal_cache.get(cache_key)
-                    if last and last['signal'] == sig_type:
-                        elapsed = (datetime.now(timezone.utc) - last['timestamp']).total_seconds()
-                        if elapsed < 300:  # 5 minutes dedup
-                            print(f"[SKIP] Duplicate {sig_type} for {pair} (last: {elapsed:.0f}s ago)")
-                            continue
+                model_provenance = _signal_provenance_from_result(result)
 
+                # Save every generated actionable signal immediately.
+                if sig_type in ('BUY', 'SELL'):
                     # Save to MongoDB
                     signal_doc = {
                         'pair': pair.replace('/', '_'),
@@ -1040,12 +1021,6 @@ def continuous_signal_generator():
                     }
                     db_result = signals_collection.insert_one(signal_doc)
                     print(f"[DB] Signal saved: {sig_type} {pair} @ {sig_conf:.1f}% (ID: {db_result.inserted_id})")
-
-                    # Update dedup cache
-                    _last_signal_cache[cache_key] = {
-                        'signal': sig_type,
-                        'timestamp': datetime.now(timezone.utc)
-                    }
 
                     # Save in-app notification (always, regardless of push permission)
                     emoji = "\U0001f4c8" if sig_type == "BUY" else "\U0001f4c9"
@@ -2311,9 +2286,12 @@ def get_signal():
         pair, pair_error = enforce_trading_scope(request.args.get('pair', 'EUR/USD'))
         if pair_error:
             return pair_error
+        conf_threshold = min_confidence / 100.0 if min_confidence > 1 else min_confidence
+        conf_threshold = max(0.0, min(1.0, conf_threshold))
+        cache_key = f"{pair}|{conf_threshold:.4f}"
 
         # Check signal response cache (60s TTL)
-        cached = _signal_response_cache.get(pair)
+        cached = _signal_response_cache.get(cache_key)
         if cached and (time.time() - cached['time']) < SIGNAL_CACHE_TTL:
             cached_data = cached['data'].copy()
             cached_data['cached'] = True
@@ -2347,13 +2325,42 @@ def get_signal():
         now = datetime.now()
         market_closed = now.weekday() >= 5 or (now.weekday() == 0 and now.hour < 8)
 
-        conf_threshold = min_confidence / 100.0 if min_confidence > 1 else min_confidence
         signal = signal_generator.generate_signal(
             df_1min=df,
             multi_tf_data=multi_tf,
             min_confidence=conf_threshold,
             symbol=pair.replace('/', '')
         )
+
+        saved_signal_id = None
+        sig_type = str(signal.get('signal', '')).upper().strip()
+        sig_conf = signal.get('confidence')
+
+        # Ensure model-generated BUY/SELL prediction is persisted immediately.
+        if sig_type in ('BUY', 'SELL') and sig_conf is not None:
+            try:
+                signal_doc = {
+                    'pair': pair.replace('/', '_'),
+                    'signal': sig_type,
+                    'confidence': float(sig_conf),
+                    'entry_price': signal.get('entry_price'),
+                    'stop_loss': signal.get('stop_loss'),
+                    'take_profit': signal.get('take_profit'),
+                    'sl_pips': signal.get('sl_pips'),
+                    'tp_pips': signal.get('tp_pips'),
+                    'risk_reward': signal.get('risk_reward'),
+                    'model_probabilities': signal.get('model_probabilities'),
+                    'models_agree': signal.get('models_agree'),
+                    'atr_pips': signal.get('atr_pips'),
+                    'reason': signal.get('reason'),
+                    'source': 'auto',
+                    'created_at': datetime.now(timezone.utc),
+                    'status': 'active'
+                }
+                db_result = signals_collection.insert_one(signal_doc)
+                saved_signal_id = str(db_result.inserted_id)
+            except Exception as save_err:
+                print(f"[WARN] /signal immediate save failed for {pair}: {save_err}")
 
         # Push notification хэрэггүй — continuous_signal_generator background-д хариуцна
 
@@ -2370,11 +2377,12 @@ def get_signal():
                 'market_closed': market_closed,
                 'note': 'Market хаалттай үед сүүлийн арилжааны дата' if market_closed else None
             },
+            'saved_signal_id': saved_signal_id,
             **signal
         }
 
         # Cache the response
-        _signal_response_cache[pair] = {'data': response_data, 'time': time.time()}
+        _signal_response_cache[cache_key] = {'data': response_data, 'time': time.time()}
 
         return jsonify(response_data)
 
@@ -2387,43 +2395,12 @@ def get_signal():
 
 @app.route('/signal/demo', methods=['GET'])
 def get_signal_demo():
-    """Demo signal with test data"""
-    try:
-        if signal_generator is None or not signal_generator.is_loaded:
-            return jsonify({
-                'success': False,
-                'error': 'Signal Generator ачаалагдаагүй'
-            }), 500
-        
-        min_confidence, min_confidence_error, _min_conf_status = _parse_float_query_param('min_confidence')
-        if min_confidence_error:
-            return min_confidence_error
-        if min_confidence is None:
-            min_confidence = 85.0
-        
-        import pandas as pd
-        test_file = Path(__file__).parent.parent / 'data' / 'EUR_USD_test.csv'
-        
-        if not test_file.exists():
-            return jsonify({'success': False, 'error': 'Test data олдсонгүй'}), 404
-        
-        df = pd.read_csv(test_file)
-        df.columns = df.columns.str.lower()
-        df = df.tail(500).reset_index(drop=True)
-        
-        signal = signal_generator.generate_signal(df, min_confidence)
-        
-        return jsonify({
-            'success': True,
-            'pair': 'EUR_USD',
-            'demo': True,
-            **signal
-        })
-        
-    except Exception as e:
-        print(f"Signal V2 demo error: {e}")
-        logger.exception('Signal demo failed')
-        return _public_error_response()
+    """Demo endpoint intentionally disabled to avoid ambiguous behavior in production."""
+    return jsonify({
+        'success': False,
+        'error': 'disabled',
+        'message': '/signal/demo endpoint is disabled. Use /signal with pair and min_confidence.'
+    }), 410
 
 # ==================== PREDICT (Signal wrapper) ====================
 
@@ -2587,24 +2564,32 @@ def save_signal(payload):
         
         # Required fields
         signal_type = str(data.get('signal', '')).strip().upper()
-        confidence = data.get('confidence')
+        confidence_raw = data.get('confidence')
         normalized_pair, pair_error = enforce_trading_scope(data.get('pair', 'EUR_USD'))
         if pair_error:
             return pair_error
 
         pair = normalized_pair.replace('/', '_')  # Normalize: EUR/USD → EUR_USD
         
-        if not signal_type or confidence is None:
+        if not signal_type or confidence_raw is None:
             return jsonify({'success': False, 'error': 'signal, confidence шаардлагатай'}), 400
 
-        if signal_type not in ('BUY', 'SELL', 'HOLD'):
-            return jsonify({'success': False, 'error': 'signal нь BUY/SELL/HOLD байх ёстой'}), 400
+        if signal_type not in {'BUY', 'SELL', 'HOLD'}:
+            return jsonify({'success': False, 'error': 'signal must be BUY, SELL, or HOLD'}), 400
 
-        confidence_value = float(confidence)
-        if confidence_value <= 1:
+        try:
+            confidence_value = float(confidence_raw)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'confidence must be a number'}), 400
+
+        # Canonical confidence unit: always store as 0-100 percentage.
+        if 0.0 <= confidence_value <= 1.0:
             confidence_value *= 100.0
-
         confidence_value = max(0.0, min(100.0, confidence_value))
+
+        source = str(data.get('source', 'manual')).strip().lower()
+        if source not in {'auto', 'manual'}:
+            source = 'manual'
 
         # Manual submissions are isolated from public analytics to prevent poisoning.
         manual_note = str(data.get('reason', '') or '').strip()
@@ -2636,12 +2621,14 @@ def save_signal(payload):
             'sl_pips': sl_pips,
             'tp_pips': tp_pips,
             'risk_reward': risk_reward,
+            'model_probabilities': data.get('model_probabilities'),
+            'models_agree': data.get('models_agree'),
             'atr_pips': atr_pips,
             'reason': manual_note,
             'model_version': data.get('model_version') or manual_provenance.get('model_version'),
             'model_provenance': manual_provenance,
             'run_id': manual_provenance.get('run_id'),
-            'source': 'manual',
+            'source': source,
             'visibility': 'private',
             'submitted_by_user_id': str(payload.get('user_id', '')),
             'submitted_by_email': str(payload.get('email', '')).strip().lower(),
@@ -2652,7 +2639,7 @@ def save_signal(payload):
         # Insert to MongoDB
         result = signals_collection.insert_one(signal_doc)
         
-        print(f"✓ Manual signal хадгалагдлаа: {signal_type} @ {confidence_value:.1f}% (ID: {result.inserted_id})")
+        print(f"✓ Signal хадгалагдлаа: {signal_type} @ {confidence_value:.2f}% (ID: {result.inserted_id})")
         
         return jsonify({
             'success': True,
@@ -2800,10 +2787,11 @@ def get_signals_stats():
 @app.route('/signals/latest', methods=['GET'])
 def get_latest_signal():
     """
-    Сүүлийн auto-generated сигнал(ууд) авах endpoint
+    Сүүлийн сигнал(ууд) авах endpoint (auto + manual)
     Query params:
         - pair: Валютын хослол (default: EUR_USD)
         - limit: Хэдэн сигнал авах (default: 1, max: 20)
+        - min_confidence: Хамгийн бага итгэлцэл (optional, 0-1 эсвэл 0-100)
     """
     try:
         limit_result = enforce_public_rate_limit('signals_latest')
@@ -2814,15 +2802,32 @@ def get_latest_signal():
         if pair_error:
             return pair_error
 
-        pair = normalized_pair.replace('/', '_')
+        pair_normalized = normalized_pair.upper().strip()
+        pair_slash = pair_normalized.replace('_', '/')
+        pair_under = pair_normalized.replace('/', '_')
+        pair_compact = pair_slash.replace('/', '')
+
         limit, limit_error, _limit_status = _parse_int_query_param('limit', 1, minimum=1, maximum=20)
         if limit_error:
             return limit_error
 
-        trusted_pair_query = _trusted_signal_filter_for_pair(pair)
-        query = {**trusted_pair_query, 'signal': {'$in': ['BUY', 'SELL']}}
+        min_confidence, min_confidence_error, _min_conf_status = _parse_float_query_param('min_confidence')
+        if min_confidence_error:
+            return min_confidence_error
 
-        # Return BUY/SELL signals from trusted auto pipeline only.
+        query = {
+            'pair': {'$in': [pair_under, pair_slash, pair_compact]},
+            'signal': {'$in': ['BUY', 'SELL']},
+        }
+
+        if min_confidence is not None:
+            min_conf = min_confidence
+            if 0.0 <= min_conf <= 1.0:
+                min_conf *= 100.0
+            min_conf = max(0.0, min(100.0, min_conf))
+            query['confidence'] = {'$gte': min_conf}
+
+        # Return all BUY/SELL signals (auto + manual), sorted by newest.
         results = list(signals_collection.find(
             query,
             sort=[('created_at', -1)]

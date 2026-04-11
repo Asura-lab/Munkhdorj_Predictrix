@@ -16,7 +16,7 @@ import { useTheme } from "../context/ThemeContext";
 import { getColors } from "../config/theme";
 import { UI_COPY } from "../config/copy";
 import { useQuery } from "@tanstack/react-query";
-import { getSignal, getRecentSignals } from "../services/api";
+import { getLatestSignal, getRecentSignals } from "../services/api";
 import { updateNotificationPreferences } from "../services/notificationService";
 import { RefreshCw, SlidersHorizontal, Check } from "lucide-react-native";
 
@@ -57,11 +57,11 @@ const PredictionScreen = () => {
     refetch: refetchLive,
     isRefetching: isRefetchingLive,
   } = useQuery({
-    queryKey: ["livePrediction", PAIR],
+    queryKey: ["livePrediction", PAIR, signalThreshold],
     queryFn: async () => {
-      const r = await getSignal(0, PAIR);
+      const r = await getLatestSignal(PAIR, signalThreshold * 100);
       if (!r.success) throw new Error(r.error);
-      return r.data;
+      return r.data?.signal ?? null;
     },
     staleTime: 60000,
     gcTime: 5 * 60 * 1000,
@@ -74,9 +74,9 @@ const PredictionScreen = () => {
     isLoading: loadingRecent,
     refetch: refetchRecent,
   } = useQuery({
-    queryKey: ["recentSignals", PAIR],
+    queryKey: ["recentSignals", PAIR, signalThreshold],
     queryFn: async () => {
-      const r = await getRecentSignals(PAIR, 5);
+      const r = await getRecentSignals(PAIR, 5, signalThreshold * 100);
       if (r.success && r.data?.signals) return r.data.signals as any[];
       return [];
     },
@@ -335,8 +335,8 @@ const PredictionScreen = () => {
           <View style={styles.loadingBox}>
             <ActivityIndicator color={colors.primary} />
           </View>
-        ) : recentData && recentData.filter((s: any) => (s.confidence ?? 0) >= signalThreshold * 100).length > 0 ? (
-          recentData.filter((s: any) => (s.confidence ?? 0) >= signalThreshold * 100).map((sig: any, idx: number) => (
+        ) : recentData && recentData.length > 0 ? (
+          recentData.map((sig: any, idx: number) => (
             <View key={sig._id || idx} style={[styles.card, { marginBottom: 10 }]}>
               <View style={styles.signalTop}>
                 <View style={[styles.signalBadge, { backgroundColor: getSignalColor(sig.signal) }]}>
@@ -375,41 +375,11 @@ const PredictionScreen = () => {
               </View>
             </View>
           ))
-        ) : recentData && recentData.length > 0 ? (
-          // Signals exist but none pass the threshold
-          (() => {
-            const best = recentData.reduce((a: any, b: any) =>
-              (b.confidence ?? 0) > (a.confidence ?? 0) ? b : a, recentData[0]);
-            return (
-              <View style={styles.emptyBox}>
-                <Text style={styles.emptyThresholdTitle}>
-                  {(signalThreshold * 100).toFixed(0)}%-аас дээш итгэлтэй дохио байхгүй байна
-                </Text>
-                <Text style={styles.emptyThresholdSub}>
-                  Сүүлийн үеийн хамгийн итгэлтэй дохио:
-                </Text>
-                <View style={[styles.emptyBestRow]}>
-                  <View style={[styles.signalBadgeSmall, { backgroundColor: getSignalColor(best.signal) }]}>
-                    <Text style={styles.signalBadgeSmallText}>
-                      {best.signal === "BUY" ? "BUY ↑" : "SELL ↓"}
-                    </Text>
-                  </View>
-                  <Text style={[styles.emptyBestConf, { color: getSignalColor(best.signal) }]}>
-                    {(best.confidence ?? 0).toFixed(1)}%
-                  </Text>
-                  {best.created_at && (
-                    <Text style={styles.emptyBestTime}>{formatTime(best.created_at)}</Text>
-                  )}
-                </View>
-                <Text style={styles.emptyThresholdHint}>
-                  Босгыг бууруулахын тулд дээрх товчийг дарна уу.
-                </Text>
-              </View>
-            );
-          })()
         ) : (
           <View style={styles.emptyBox}>
-            <Text style={styles.emptyText}>Өндөр итгэлтэй дохио бүртгэгдээгүй байна</Text>
+            <Text style={styles.emptyText}>
+              {(signalThreshold * 100).toFixed(0)}%-аас дээш итгэлтэй дохио одоогоор байхгүй байна
+            </Text>
           </View>
         )}
 

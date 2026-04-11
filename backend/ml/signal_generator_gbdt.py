@@ -31,9 +31,9 @@ LATEST_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mo
 
 
 def resolve_model_path() -> str:
-    """Resolve active model path.
+    """Return the fixed production model path.
 
-    App policy: always use the latest trained production model only.
+    Runtime policy: use only EURUSD_gbdt_experimental.pkl.
     """
     return LATEST_MODEL_PATH
 

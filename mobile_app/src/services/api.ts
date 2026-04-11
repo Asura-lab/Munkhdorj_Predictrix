@@ -491,14 +491,22 @@ export const getSignalsStats = async (pair = "EUR_USD") => {
 };
 
 /**
- * Сүүлийн auto-generated сигнал авах
+ * DB-д хадгалагдсан сүүлийн сигнал авах (auto + manual)
  * @param {string} pair - Currency pair (default: EUR_USD)
+ * @param {number} minConfidence - Minimum confidence (0-100)
  * @returns {Object} { success, signal }
  */
-export const getLatestSignal = async (pair: string = "EUR/USD") => {
+export const getLatestSignal = async (
+  pair: string = "EUR/USD",
+  minConfidence?: number
+) => {
   try {
     const pairParam = pair.replace("/", "_");
-    const response = await apiClient.get(`/signals/latest?pair=${pairParam}`);
+    const minConfidenceParam =
+      typeof minConfidence === "number" ? `&min_confidence=${minConfidence}` : "";
+    const response = await apiClient.get(
+      `/signals/latest?pair=${pairParam}${minConfidenceParam}`
+    );
     return { success: true, data: response.data };
   } catch (error: any) {
     console.error("Latest signal авах алдаа:", error.message);
@@ -510,15 +518,24 @@ export const getLatestSignal = async (pair: string = "EUR/USD") => {
 };
 
 /**
- * Сүүлийн хэд хэдэн өндөр итгэлцэлтэй сигналуудыг авах
+ * DB-д хадгалагдсан сүүлийн сигналуудыг босгоор шүүж авах
  * @param {string} pair - Currency pair (default: EUR/USD)
  * @param {number} limit - Хэдийг авах (default: 5)
+ * @param {number} minConfidence - Minimum confidence (0-100)
  * @returns {Object} { success, signals[] }
  */
-export const getRecentSignals = async (pair: string = "EUR/USD", limit: number = 5) => {
+export const getRecentSignals = async (
+  pair: string = "EUR/USD",
+  limit: number = 5,
+  minConfidence?: number
+) => {
   try {
     const pairParam = pair.replace("/", "_");
-    const response = await apiClient.get(`/signals/latest?pair=${pairParam}&limit=${limit}`);
+    const minConfidenceParam =
+      typeof minConfidence === "number" ? `&min_confidence=${minConfidence}` : "";
+    const response = await apiClient.get(
+      `/signals/latest?pair=${pairParam}&limit=${limit}${minConfidenceParam}`
+    );
     return { success: true, data: response.data };
   } catch (error: any) {
     console.error("Recent signals авах алдаа:", error.message);
