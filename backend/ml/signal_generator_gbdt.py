@@ -6,7 +6,6 @@ Models: LightGBM + XGBoost + CatBoost ensemble with calibration
 """
 
 import os
-import glob
 import joblib
 import numpy as np
 import pandas as pd
@@ -25,26 +24,10 @@ LATEST_MODEL_PATH = os.path.join(MODELS_DIR, DEFAULT_MODEL_BASENAME)
 
 
 def resolve_model_path() -> str:
-    """Resolve active model path.
+    """Return the fixed production model path.
 
-    Resolution order:
-    1) ACTIVE_GBDT_MODEL_PATH/GBDT_MODEL_PATH env override (promotion pin)
-    2) Newest EURUSD_gbdt*.pkl in backend/ml/models/
-    3) Legacy fallback path (EURUSD_gbdt_experimental.pkl)
+    Runtime policy: use only EURUSD_gbdt_experimental.pkl.
     """
-    explicit = (os.getenv('ACTIVE_GBDT_MODEL_PATH') or os.getenv('GBDT_MODEL_PATH') or '').strip()
-    if explicit:
-        explicit_path = os.path.abspath(explicit)
-        if os.path.exists(explicit_path):
-            return explicit_path
-        print(f"[GBDT] ACTIVE_GBDT_MODEL_PATH not found: {explicit_path}")
-
-    pattern = os.path.join(MODELS_DIR, 'EURUSD_gbdt*.pkl')
-    candidates = [p for p in glob.glob(pattern) if os.path.isfile(p)]
-    if candidates:
-        candidates.sort(key=os.path.getmtime, reverse=True)
-        return candidates[0]
-
     return LATEST_MODEL_PATH
 
 
