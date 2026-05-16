@@ -35,22 +35,37 @@ def _is_production_runtime() -> bool:
 
 PRODUCTION_RUNTIME = _is_production_runtime()
 
+# In development, auto-load .env unless explicitly disabled.
+# In production, .env loading is always blocked.
+_dev_dotenv_default = 'false' if PRODUCTION_RUNTIME else 'true'
+_allow_dotenv_requested = _as_bool(os.getenv('ALLOW_LOCAL_DOTENV', _dev_dotenv_default))
 ALLOW_LOCAL_DOTENV = False
-if _as_bool(os.getenv('ALLOW_LOCAL_DOTENV', 'false')):
-    print('[WARN] ALLOW_LOCAL_DOTENV is ignored. Local dotenv loading is disabled by security policy.')
+
+if _allow_dotenv_requested and PRODUCTION_RUNTIME:
+    print('[WARN] ALLOW_LOCAL_DOTENV is ignored in production runtime.')
+elif _allow_dotenv_requested and ENV_PATH.exists():
+    ALLOW_LOCAL_DOTENV = True
+    # Load .env into os.environ without overriding already-set variables.
+    with open(ENV_PATH, encoding='utf-8-sig') as _dotenv_file:
+        for _line in _dotenv_file:
+            _line = _line.strip()
+            if not _line or _line.startswith('#') or '=' not in _line:
+                continue
+            _k, _, _v = _line.partition('=')
+            _k = _k.strip()
+            if _k and _k not in os.environ:
+                os.environ[_k] = _v.strip()
+    print(f'[OK] Local .env loaded from {ENV_PATH}')
+elif _allow_dotenv_requested:
+    print(f'[WARN] ALLOW_LOCAL_DOTENV=true but .env not found at {ENV_PATH}')
+
+# Force STRICT_RUNTIME_SECRETS=false in local dev so missing secrets use fallbacks.
+# The .env may set it to true (for production parity), but locally we override it.
+if not PRODUCTION_RUNTIME:
+    os.environ.setdefault('STRICT_RUNTIME_SECRETS', 'false')
 
 strict_default = 'true' if PRODUCTION_RUNTIME else 'false'
 STRICT_RUNTIME_SECRETS = _as_bool(os.getenv('STRICT_RUNTIME_SECRETS', strict_default))
-
-if PRODUCTION_RUNTIME and ALLOW_LOCAL_DOTENV:
-    if STRICT_RUNTIME_SECRETS:
-        raise ValueError("ALLOW_LOCAL_DOTENV=true is not allowed in production runtime.")
-    print("[WARN] ALLOW_LOCAL_DOTENV ignored in production runtime.")
-    ALLOW_LOCAL_DOTENV = False
-
-if ALLOW_LOCAL_DOTENV and ENV_PATH.exists():
-    # Local dotenv loading is intentionally disabled to avoid accidental secret ingestion.
-    print('[WARN] Local dotenv loading is disabled by security policy. Using runtime environment only.')
 
 # MongoDB Configuration
 MONGO_URI = os.getenv('MONGO_URI')
@@ -157,7 +172,9 @@ MODELS_DIR = BASE_DIR / 'models'
 
 SUPPORTED_PAIR = "EUR_USD"
 
+_mongo_type = "Atlas (cloud)" if MONGO_URI.startswith("mongodb+srv") else "Local (localhost)"
 print("[OK] Configuration loaded from runtime environment variables")
 print(f"[INFO] Production runtime mode: {PRODUCTION_RUNTIME}")
 print(f"[INFO] Strict runtime secrets: {STRICT_RUNTIME_SECRETS}")
+print(f"[INFO] MongoDB: {_mongo_type}")
 print(f"[INFO] Using Yahoo Finance (yfinance) for forex data — no API key required")

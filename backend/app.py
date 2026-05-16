@@ -559,6 +559,13 @@ try:
     _ensure_index(refresh_tokens_collection, 'expires_at', name='ttl_refresh_expires', expireAfterSeconds=0)
     _ensure_index(signals_collection, [('pair', 1), ('created_at', -1)], name='idx_signals_pair_created')
     _ensure_index(signals_collection, [('pair', 1), ('source', 1), ('created_at', -1)], name='idx_signals_pair_source_created')
+    _ensure_index(
+        signals_collection,
+        [('timestamp', 1), ('symbol', 1), ('timeframe', 1)],
+        name='uniq_signals_timestamp_symbol_timeframe_auto',
+        unique=True,
+        partialFilterExpression={'source': 'auto', 'signal': {'$in': ['BUY', 'SELL']}},
+    )
     _ensure_index(signals_collection, [('run_id', 1), ('created_at', -1)], name='idx_signals_run_id_created')
     _ensure_index(signals_collection, [('model_version', 1), ('created_at', -1)], name='idx_signals_model_version_created')
     _ensure_index(job_locks_collection, 'expires_at', name='ttl_job_locks_expires', expireAfterSeconds=0)
@@ -924,6 +931,80 @@ SIGNAL_PAIRS = [TRADING_SCOPE_PAIR]
 _signal_response_cache = {}  # { "pair|conf": { "data": ..., "time": ... } }
 SIGNAL_CACHE_TTL = 60  # seconds
 
+
+def _normalize_signal_identity(pair: str, timeframe: str = 'M1', timestamp_hint=None):
+    symbol = str(pair or '').replace('/', '').replace('_', '').upper() or 'EURUSD'
+    tf = str(timeframe or 'M1').strip().upper() or 'M1'
+
+    ts = timestamp_hint
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+        except Exception:
+            ts = None
+    if ts is None:
+        ts = datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ts = ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+    return {
+        'timestamp': ts,
+        'symbol': symbol,
+        'timeframe': tf,
+    }
+
+
+def _upsert_auto_signal(signal_doc: dict, timestamp_hint=None, timeframe: str = 'M1'):
+    now_utc = datetime.now(timezone.utc)
+    identity = _normalize_signal_identity(signal_doc.get('pair'), timeframe=timeframe, timestamp_hint=timestamp_hint)
+
+    signal_doc = dict(signal_doc or {})
+    signal_doc['source'] = 'auto'
+    signal_doc.update(identity)
+    signal_doc.setdefault('created_at', now_utc)
+
+    dedupe_filter = {
+        'source': 'auto',
+        'timestamp': identity['timestamp'],
+        'symbol': identity['symbol'],
+        'timeframe': identity['timeframe'],
+    }
+
+    update_doc = {
+        '$setOnInsert': signal_doc,
+        '$set': {
+            'pair': signal_doc.get('pair'),
+            'signal': signal_doc.get('signal'),
+            'confidence': signal_doc.get('confidence'),
+            'entry_price': signal_doc.get('entry_price'),
+            'stop_loss': signal_doc.get('stop_loss'),
+            'take_profit': signal_doc.get('take_profit'),
+            'sl_pips': signal_doc.get('sl_pips'),
+            'tp_pips': signal_doc.get('tp_pips'),
+            'risk_reward': signal_doc.get('risk_reward'),
+            'model_probabilities': signal_doc.get('model_probabilities'),
+            'model_version': signal_doc.get('model_version'),
+            'model_provenance': signal_doc.get('model_provenance'),
+            'run_id': signal_doc.get('run_id'),
+            'models_agree': signal_doc.get('models_agree'),
+            'atr_pips': signal_doc.get('atr_pips'),
+            'reason': signal_doc.get('reason'),
+            'status': signal_doc.get('status', 'active'),
+            'updated_at': now_utc,
+        }
+    }
+
+    try:
+        write_result = signals_collection.update_one(dedupe_filter, update_doc, upsert=True)
+        if write_result.upserted_id is not None:
+            return str(write_result.upserted_id), True
+        existing = signals_collection.find_one(dedupe_filter, {'_id': 1})
+        return (str(existing['_id']) if existing else None), False
+    except DuplicateKeyError:
+        existing = signals_collection.find_one(dedupe_filter, {'_id': 1})
+        return (str(existing['_id']) if existing else None), False
+
 def continuous_signal_generator():
     """
     Background thread: минут тутамд модел ажиллуулж таамаглал гаргана.
@@ -998,6 +1079,11 @@ def continuous_signal_generator():
                 # Save every generated actionable signal immediately.
                 if sig_type in ('BUY', 'SELL'):
                     # Save to MongoDB
+                    candle_ts = None
+                    try:
+                        candle_ts = df['time'].iloc[-1]
+                    except Exception:
+                        candle_ts = None
                     signal_doc = {
                         'pair': pair.replace('/', '_'),
                         'signal': sig_type,
@@ -1019,8 +1105,18 @@ def continuous_signal_generator():
                         'created_at': datetime.now(timezone.utc),
                         'status': 'active'
                     }
-                    db_result = signals_collection.insert_one(signal_doc)
-                    print(f"[DB] Signal saved: {sig_type} {pair} @ {sig_conf:.1f}% (ID: {db_result.inserted_id})")
+                    saved_signal_id, inserted_new = _upsert_auto_signal(
+                        signal_doc,
+                        timestamp_hint=candle_ts,
+                        timeframe='M1',
+                    )
+                    if inserted_new:
+                        print(f"[DB] Signal saved: {sig_type} {pair} @ {sig_conf:.1f}% (ID: {saved_signal_id})")
+                    else:
+                        print(f"[DB] Signal deduplicated: {sig_type} {pair} @ {sig_conf:.1f}% (ID: {saved_signal_id})")
+
+                    if not inserted_new:
+                        continue
 
                     # Save in-app notification (always, regardless of push permission)
                     emoji = "\U0001f4c8" if sig_type == "BUY" else "\U0001f4c9"
@@ -2357,8 +2453,11 @@ def get_signal():
                     'created_at': datetime.now(timezone.utc),
                     'status': 'active'
                 }
-                db_result = signals_collection.insert_one(signal_doc)
-                saved_signal_id = str(db_result.inserted_id)
+                saved_signal_id, _inserted_new = _upsert_auto_signal(
+                    signal_doc,
+                    timestamp_hint=data_to,
+                    timeframe='M1',
+                )
             except Exception as save_err:
                 print(f"[WARN] /signal immediate save failed for {pair}: {save_err}")
 
@@ -2636,11 +2735,25 @@ def save_signal(payload):
             'status': 'active'  # active, closed, expired
         }
         
+        if source == 'auto':
+            signal_id, inserted_new = _upsert_auto_signal(
+                signal_doc,
+                timestamp_hint=data.get('timestamp') or data.get('created_at'),
+                timeframe=str(data.get('timeframe') or 'M1'),
+            )
+            print(f"✓ Auto signal {'хадгалагдлаа' if inserted_new else 'давхардалгүй шинэчлэгдлээ'}: {signal_type} @ {confidence_value:.2f}% (ID: {signal_id})")
+            return jsonify({
+                'success': True,
+                'message': 'Signal амжилттай хадгалагдлаа' if inserted_new else 'Signal давхардалгүй шинэчлэгдлээ',
+                'signal_id': signal_id,
+                'inserted': inserted_new,
+            })
+
         # Insert to MongoDB
         result = signals_collection.insert_one(signal_doc)
-        
+
         print(f"✓ Signal хадгалагдлаа: {signal_type} @ {confidence_value:.2f}% (ID: {result.inserted_id})")
-        
+
         return jsonify({
             'success': True,
             'message': 'Signal амжилттай хадгалагдлаа',
@@ -2993,10 +3106,15 @@ def _get_latest_analysis_from_db(pair):
     if insights_collection is None:
         return None
 
-    doc = insights_collection.find_one(
-        {'pair': pair, 'error': {'$ne': True}},
-        sort=[('_id', -1)]
-    )
+    try:
+        doc = insights_collection.find_one(
+            {'pair': pair, 'error': {'$ne': True}},
+            sort=[('_id', -1)]
+        )
+    except Exception as db_err:
+        logger.warning(f'_get_latest_analysis_from_db({pair}): DB query failed: {db_err}')
+        return None
+
     if not doc:
         return None
 
@@ -3515,14 +3633,17 @@ def pair_analysis_preloader_task():
         update_background_job_state('pair_analysis_preloader', 'error', 'Worker lock unavailable at start')
         return
 
-    for pair in PRELOADED_ANALYSIS_PAIRS:
-        cached = _get_cached_analysis(pair)
-        if cached:
-            age = int(time.time() - cached['created_ts'])
-            print(f"[OK] Preloaded {pair} analysis from cache/DB (age={age}s)")
-        else:
-            print(f"[INFO] No existing analysis for {pair}; scheduling initial generation")
-            _schedule_pair_refresh(pair, force=True)
+    try:
+        for pair in PRELOADED_ANALYSIS_PAIRS:
+            cached = _get_cached_analysis(pair)
+            if cached:
+                age = int(time.time() - cached['created_ts'])
+                print(f"[OK] Preloaded {pair} analysis from cache/DB (age={age}s)")
+            else:
+                print(f"[INFO] No existing analysis for {pair}; scheduling initial generation")
+                _schedule_pair_refresh(pair, force=True)
+    except Exception as preload_err:
+        print(f"[WARN] pair_analysis_preloader initial load failed (non-fatal): {preload_err}")
 
     while True:
         if not _renew_worker_lock('pair_analysis_preloader', 900):

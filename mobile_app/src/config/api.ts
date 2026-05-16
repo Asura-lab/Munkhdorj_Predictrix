@@ -13,10 +13,15 @@ const DEFAULT_PRODUCTION_URL = 'https://predictrix-api.fly.dev';
 const ENV_PRODUCTION_URL = (globalThis as any)?.process?.env?.EXPO_PUBLIC_API_BASE_URL?.trim();
 const PRODUCTION_URL = ENV_PRODUCTION_URL || DEFAULT_PRODUCTION_URL;
 
-// Android emulator uses 10.0.2.2 to reach host machine; iOS uses localhost
-const LOCAL_URL = Platform.OS === 'android'
-  ? 'http://10.0.2.2:5000'
-  : 'http://localhost:5000';
+// Physical device: set EXPO_PUBLIC_LOCAL_API_HOST to your PC's LAN IP (e.g. 192.168.1.x)
+// Android emulator: 10.0.2.2 reaches the host machine automatically
+// iOS simulator / web: localhost works fine
+const LOCAL_HOST = (globalThis as any)?.process?.env?.EXPO_PUBLIC_LOCAL_API_HOST?.trim();
+const LOCAL_URL = LOCAL_HOST
+  ? `http://${LOCAL_HOST}:5000`
+  : Platform.OS === 'android'
+    ? 'http://10.0.2.2:5000'
+    : 'http://localhost:5000';
 
 const getApiUrl = () => {
   if (__DEV__) {

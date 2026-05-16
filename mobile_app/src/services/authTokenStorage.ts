@@ -71,7 +71,7 @@ async function getStoredToken(storageKey: string): Promise<string | null> {
     }
   }
 
-  return null;
+  return AsyncStorage.getItem(storageKey);
 }
 
 async function setStoredToken(storageKey: string, token: string): Promise<void> {
@@ -83,7 +83,7 @@ async function setStoredToken(storageKey: string, token: string): Promise<void> 
     return;
   }
 
-  throw new Error("Secure storage unavailable for auth token persistence");
+  await AsyncStorage.setItem(storageKey, token);
 }
 
 async function clearStoredToken(storageKey: string): Promise<void> {
@@ -114,20 +114,18 @@ async function getStoredValue(storageKey: string, migrateFromLegacy = false): Pr
     }
   }
 
-  if (!migrateFromLegacy || !secureAvailable) {
-    return null;
-  }
-
   const legacyValue = await AsyncStorage.getItem(storageKey);
   if (!legacyValue) {
     return null;
   }
 
-  try {
-    await SecureStore.setItemAsync(storageKey, legacyValue);
-    await AsyncStorage.removeItem(storageKey);
-  } catch {
-    // Keep legacy value if migration fails.
+  if (secureAvailable && migrateFromLegacy) {
+    try {
+      await SecureStore.setItemAsync(storageKey, legacyValue);
+      await AsyncStorage.removeItem(storageKey);
+    } catch {
+      // Keep legacy value if migration fails.
+    }
   }
 
   return legacyValue;
@@ -137,7 +135,8 @@ async function setStoredValue(storageKey: string, value: string): Promise<void> 
   const secureAvailable = await isSecureStoreAvailable();
 
   if (!secureAvailable) {
-    throw new Error("Secure storage unavailable for profile persistence");
+    await AsyncStorage.setItem(storageKey, value);
+    return;
   }
 
   await SecureStore.setItemAsync(storageKey, value);

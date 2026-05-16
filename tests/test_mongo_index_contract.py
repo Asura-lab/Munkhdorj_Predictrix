@@ -30,6 +30,14 @@ class MongoIndexContractTest(unittest.TestCase):
             self.content,
         )
 
+    def test_signal_idempotency_unique_index_present(self):
+        self.assertIn("name='uniq_signals_timestamp_symbol_timeframe_auto'", self.content)
+        self.assertIn("[('timestamp', 1), ('symbol', 1), ('timeframe', 1)]", self.content)
+        self.assertIn("partialFilterExpression={'source': 'auto', 'signal': {'$in': ['BUY', 'SELL']}}", self.content)
+
+    def test_auto_signal_upsert_present(self):
+        self.assertIn("signals_collection.update_one(dedupe_filter, update_doc, upsert=True)", self.content)
+
 
 if __name__ == "__main__":
     unittest.main()

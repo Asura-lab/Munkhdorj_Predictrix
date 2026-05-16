@@ -117,3 +117,6 @@ credentials.json
 
 # Local research/training workspace (do not push)
 Protrader/
+
+# claude
+claude/

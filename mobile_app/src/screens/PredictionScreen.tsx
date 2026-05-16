@@ -1,4 +1,4 @@
-﻿import React, { useState, useCallback } from "react";
+import React, { useState, useCallback } from "react";
 import {
   View,
   Text,
@@ -16,7 +16,7 @@ import { useTheme } from "../context/ThemeContext";
 import { getColors } from "../config/theme";
 import { UI_COPY } from "../config/copy";
 import { useQuery } from "@tanstack/react-query";
-import { getLatestSignal, getRecentSignals } from "../services/api";
+import { getLatestSignal, getRecentSignals, getSignal } from "../services/api";
 import { updateNotificationPreferences } from "../services/notificationService";
 import { RefreshCw, SlidersHorizontal, Check } from "lucide-react-native";
 
@@ -48,7 +48,7 @@ const PredictionScreen = () => {
     await AsyncStorage.setItem(THRESHOLD_KEY, String(val));
     try {
       await updateNotificationPreferences({ signal_threshold: val });
-    } catch {}
+    } catch { }
   };
 
   const {
@@ -57,11 +57,11 @@ const PredictionScreen = () => {
     refetch: refetchLive,
     isRefetching: isRefetchingLive,
   } = useQuery({
-    queryKey: ["livePrediction", PAIR, signalThreshold],
+    queryKey: ["livePrediction", PAIR],
     queryFn: async () => {
-      const r = await getLatestSignal(PAIR, signalThreshold * 100);
+      const r = await getSignal(0, PAIR);
       if (!r.success) throw new Error(r.error);
-      return r.data?.signal ?? null;
+      return r.data ?? null;
     },
     staleTime: 60000,
     gcTime: 5 * 60 * 1000,
@@ -174,148 +174,13 @@ const PredictionScreen = () => {
           </View>
         ) : live ? (
           <>
-            <View style={styles.provenanceCard}>
-              <Text style={styles.provenanceTitle}>MODEL PROVENANCE</Text>
-              <View style={styles.provenanceRow}>
-                <Text style={styles.provenanceLabel}>Model</Text>
-                <Text style={styles.provenanceValue}>{provenanceModelVersion}</Text>
-              </View>
-              <View style={styles.provenanceRow}>
-                <Text style={styles.provenanceLabel}>Run ID</Text>
-                <Text style={styles.provenanceValue} numberOfLines={1}>{provenanceRunId}</Text>
-              </View>
-              {provenanceTrainedAt ? (
-                <View style={styles.provenanceRow}>
-                  <Text style={styles.provenanceLabel}>Trained</Text>
-                  <Text style={styles.provenanceValue}>{formatTime(provenanceTrainedAt)}</Text>
-                </View>
-              ) : null}
+            <View style={[styles.card, { alignItems: 'center', paddingVertical: 24 }]}>
+              <Text style={{ fontSize: 28, fontWeight: "800", color: getSignalColor(live.signal) }}>
+                {live.signal === "BUY" ? "BUY ↑" : live.signal === "SELL" ? "SELL ↓" : "HOLD"}
+              </Text>
             </View>
 
-          {live.signal === "HOLD" ? (
-            // HOLD — show directional lean if available
-            <View style={styles.card}>
-              <View style={styles.holdIconRow}>
-                <View style={[styles.holdDot, { backgroundColor: colors.warning }]} />
-                <Text style={[styles.holdTitle, { color: colors.warning }]}>Зах зээл одоо хөдөлгөөн бага байна</Text>
-              </View>
-              {live.directional_signal && live.confidence > 0 ? (
-                <View style={styles.trendHintRow}>
-                  <View style={[styles.trendHintBadge, {
-                    backgroundColor: live.directional_signal === "BUY" ? colors.success + "20" : colors.error + "20",
-                    borderColor: live.directional_signal === "BUY" ? colors.success + "50" : colors.error + "50",
-                  }]}>
-                    <Text style={[styles.trendHintDir, {
-                      color: live.directional_signal === "BUY" ? colors.success : colors.error,
-                    }]}>
-                      {live.directional_signal === "BUY" ? "↑ Өсөх" : "↓ Буурах"} хандлага
-                    </Text>
-                    <Text style={[styles.trendHintConf, {
-                      color: live.directional_signal === "BUY" ? colors.success : colors.error,
-                    }]}>
-                      {live.confidence?.toFixed(1)}%
-                    </Text>
-                  </View>
-                  <Text style={styles.holdSubText}>
-                    Хангалттай өндөр итгэлтэй арилжааны сигнал биш.
-                  </Text>
-                </View>
-              ) : (
-                <Text style={styles.holdSubText}>
-                  AI загварын шинжилгээгээр тодорхой арилжааны дохио илрэхгүй байна. Хүлээж байгаарай.
-                </Text>
-              )}
-            </View>
-          ) : (live.confidence ?? 0) >= signalThreshold * 100 ? (
-            // High confidence BUY/SELL — full card
-            <View style={styles.card}>
-              <View style={styles.signalTop}>
-                <View style={[styles.signalBadge, { backgroundColor: getSignalColor(live.signal) }]}>
-                  <Text style={styles.signalBadgeText}>
-                    {live.signal === "BUY" ? "BUY ↑" : "SELL ↓"}
-                  </Text>
-                </View>
-                <Text style={[styles.confBig, { color: getSignalColor(live.signal) }]}>
-                  {live.confidence?.toFixed(1)}%
-                </Text>
-              </View>
-              <View style={styles.progressBg}>
-                <View style={[styles.progressFill, {
-                  width: `${Math.min(live.confidence ?? 0, 100)}%`,
-                  backgroundColor: getSignalColor(live.signal),
-                }]} />
-              </View>
-              <Text style={styles.confLabel}>Итгэлцүүр</Text>
-              <View style={styles.grid}>
-                <View style={styles.gridItem}>
-                  <Text style={styles.gridLabel}>ОРОЛТ</Text>
-                  <Text style={styles.gridValue}>{live.entry_price?.toFixed(DIGITS)}</Text>
-                </View>
-                <View style={[styles.gridItem, styles.slItem]}>
-                  <Text style={[styles.gridLabel, { color: colors.error }]}>STOP LOSS</Text>
-                  <Text style={[styles.gridValue, { color: colors.error }]}>{live.stop_loss?.toFixed(DIGITS)}</Text>
-                  <Text style={styles.pipsText}>-{live.sl_pips} pips</Text>
-                </View>
-                <View style={[styles.gridItem, styles.tpItem]}>
-                  <Text style={[styles.gridLabel, { color: colors.success }]}>TAKE PROFIT</Text>
-                  <Text style={[styles.gridValue, { color: colors.success }]}>{live.take_profit?.toFixed(DIGITS)}</Text>
-                  <Text style={styles.pipsText}>+{live.tp_pips} pips</Text>
-                </View>
-                <View style={styles.gridItem}>
-                  <Text style={styles.gridLabel}>ЭРСДЭЛ/ӨГӨӨЖ</Text>
-                  <Text style={[styles.gridValue, { color: colors.success }]}>{live.risk_reward}</Text>
-                </View>
-              </View>
-            </View>
-          ) : (
-            // Low confidence BUY/SELL — trend hint only
-            <View style={styles.card}>
-              <View style={styles.signalTop}>
-                <View style={[styles.signalBadge, { backgroundColor: getSignalColor(live.signal) + "99" }]}>
-                  <Text style={styles.signalBadgeText}>
-                    {live.signal === "BUY" ? "BUY ↑" : "SELL ↓"}
-                  </Text>
-                </View>
-                <Text style={[styles.confBig, { color: getSignalColor(live.signal), fontSize: 26 }]}>
-                  {live.confidence?.toFixed(1)}%
-                </Text>
-              </View>
-              <View style={styles.progressBg}>
-                <View style={[styles.progressFill, {
-                  width: `${Math.min(live.confidence ?? 0, 100)}%`,
-                  backgroundColor: getSignalColor(live.signal),
-                }]} />
-              </View>
-              <Text style={styles.confLabel}>Итгэлцүүр</Text>
-              <View style={styles.trendBox}>
-                <Text style={styles.trendText}>
-                  {live.signal === "BUY"
-                    ? "Зах зээл өсөх хандлагатай байна."
-                    : "Зах зээл буурах хандлагатай байна."}{" "}
-                  Гэхдээ хангалттай өндөр итгэлтэй арилжааны сигнал биш.
-                </Text>
-              </View>
-            </View>
-          )}
-            
-            <View style={styles.raiCard}>
-              <Text style={styles.raiHeader}>RESPONSIBLE AI</Text>
-              <View style={styles.raiRow}>
-                <Text style={styles.raiLabel}>{UI_COPY.signal.uncertaintyLabel}</Text>
-                <Text style={styles.raiValue}>{String(live?.uncertainty_level || "UNKNOWN").toUpperCase()}</Text>
-              </View>
-              <View style={styles.raiDivider} />
-              <View style={styles.raiRow}>
-                <Text style={styles.raiLabel}>{UI_COPY.signal.actionabilityLabel}</Text>
-                <Text style={styles.raiValue}>{String(live?.actionability || "review_then_execute").replace(/_/g, " ")}</Text>
-              </View>
-              <View style={styles.raiDivider} />
-              <View style={styles.raiRow}>
-                <Text style={styles.raiLabel}>{UI_COPY.signal.humanOversightLabel}</Text>
-                <Text style={styles.raiValue}>{signalMetaLabel}</Text>
-              </View>
-              {!!live?.oversight_note && <Text style={styles.raiNote}>{live.oversight_note}</Text>}
-            </View>
+
           </>
         ) : (
           <View style={styles.emptyBox}>
@@ -368,10 +233,10 @@ const PredictionScreen = () => {
                   <Text style={[styles.gridValue, { color: colors.success }]}>{sig.take_profit?.toFixed(DIGITS) ?? "—"}</Text>
                   {sig.tp_pips != null && <Text style={styles.pipsText}>+{sig.tp_pips} pips</Text>}
                 </View>
-                <View style={styles.gridItem}>
+                {/* <View style={styles.gridItem}>
                   <Text style={styles.gridLabel}>ЭРСДЭЛ/ӨГӨӨЖ</Text>
                   <Text style={[styles.gridValue, { color: colors.success }]}>{sig.risk_reward ?? "—"}</Text>
-                </View>
+                </View> */}
               </View>
             </View>
           ))

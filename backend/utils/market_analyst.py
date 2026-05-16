@@ -77,9 +77,9 @@ class MarketAnalyst:
         try:
             self.client = MongoClient(
                 MONGO_URI,
-                serverSelectionTimeoutMS=1500,
-                connectTimeoutMS=1500,
-                socketTimeoutMS=5000,
+                serverSelectionTimeoutMS=8000,
+                connectTimeoutMS=8000,
+                socketTimeoutMS=15000,
                 maxPoolSize=20,
                 minPoolSize=0,
                 retryWrites=True,
