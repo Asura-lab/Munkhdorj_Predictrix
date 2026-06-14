@@ -1,4 +1,4 @@
-# Predictrix Forex Signal App
+# Predictrix-Forex Signal App
 
 > ВАЛЮТЫН ЗАХ ЗЭЭЛИЙН АРИЛЖААНЫ ДОХИО ҮҮСГЭХ СИСТЕМ
 
